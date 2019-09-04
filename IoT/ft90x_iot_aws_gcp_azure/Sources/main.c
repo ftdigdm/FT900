@@ -48,7 +48,9 @@
 #include "net.h"
 
 /* IOT Headers. */
+#include <iot_config.h>
 #include "iot/iot.h"
+#include "iot/iot_utils.h"
 
 
 
@@ -66,39 +68,36 @@
 ///////////////////////////////////////////////////////////////////////////////////
 /* Default network configuration. */
 #define USE_DHCP 1       // 1: Dynamic IP, 0: Static IP
-static ip_addr_t ip      = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-static ip_addr_t gateway = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-static ip_addr_t mask    = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-static ip_addr_t dns     = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-static char hostname[]   = "FT9xx";
-///////////////////////////////////////////////////////////////////////////////////
-
-
-
-///////////////////////////////////////////////////////////////////////////////////
-#define IOT_APP_MODE_PUBLISH   1
-
-#if (USE_MQTT_BROKER == MQTT_BROKER_AWS_IOT) || (USE_MQTT_BROKER == MQTT_BROKER_AWS_GREENGRASS)
-#define IOT_APP_MODE_SUBSCRIBE 0 // Disabled by default; tested working
-#elif (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
-#define IOT_APP_MODE_SUBSCRIBE 0 // Disabled by default; tested working for /config not /events
-#elif (USE_MQTT_BROKER == MQTT_BROKER_MAZ_IOT)
-#define IOT_APP_MODE_SUBSCRIBE 0 // Not yet tested
-#endif
+static ip_addr_t ip      = IPADDR4_INIT_BYTES( 0, 0, 0, 0 );
+static ip_addr_t gateway = IPADDR4_INIT_BYTES( 0, 0, 0, 0 );
+static ip_addr_t mask    = IPADDR4_INIT_BYTES( 0, 0, 0, 0 );
+static ip_addr_t dns     = IPADDR4_INIT_BYTES( 0, 0, 0, 0 );
 ///////////////////////////////////////////////////////////////////////////////////
 
 
 
 ///////////////////////////////////////////////////////////////////////////////////
 /* Task configurations. */
-#define IOT_APP_TASK_NAME                "iot_task"
-#define IOT_APP_TASK_PRIORITY            (2)
+#define IOT_APP_TASK_NAME                        "iot_task"
+#define IOT_APP_TASK_PRIORITY                    (2)
 #if (USE_MQTT_BROKER == MQTT_BROKER_AWS_IOT) || (USE_MQTT_BROKER == MQTT_BROKER_AWS_GREENGRASS)
-#define IOT_APP_TASK_STACK_SIZE          (1024)
+    #define IOT_APP_TASK_STACK_SIZE              (512)
 #elif (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
-#define IOT_APP_TASK_STACK_SIZE          (1536)
+    #define IOT_APP_TASK_STACK_SIZE              (1536 + 32)
 #elif (USE_MQTT_BROKER == MQTT_BROKER_MAZ_IOT)
-#define IOT_APP_TASK_STACK_SIZE          (1536)
+    #if (MAZ_AUTH_TYPE == AUTH_TYPE_SASTOKEN)
+        #define IOT_APP_TASK_STACK_SIZE          (1536 + 16)
+    #elif (MAZ_AUTH_TYPE == AUTH_TYPE_X509CERT)
+        #define IOT_APP_TASK_STACK_SIZE          (1024 + 64)
+    #endif
+#elif (USE_MQTT_BROKER == MQTT_BROKER_ADAFRUITIO)
+#define IOT_APP_TASK_STACK_SIZE                  (512)
+#elif (USE_MQTT_BROKER == MQTT_BROKER_UBIDOTS)
+#define IOT_APP_TASK_STACK_SIZE                  (512)
+#elif (USE_MQTT_BROKER == MQTT_BROKER_THINGSPEAK)
+#define IOT_APP_TASK_STACK_SIZE                  (512)
+#else
+#define IOT_APP_TASK_STACK_SIZE                  (512)
 #endif
 ///////////////////////////////////////////////////////////////////////////////////
 
@@ -107,314 +106,192 @@ static char hostname[]   = "FT9xx";
 ///////////////////////////////////////////////////////////////////////////////////
 /* IoT application function */
 static void iot_app_task(void *pvParameters);
-static void iot_app_process(void);
 
-/* MQTT-related abstractions called by iot_app_process */
-static inline int mqtt_is_connected(mqtt_client_t *client);
-static inline err_t mqtt_connect_async(mqtt_client_t *client, struct altcp_tls_config *config);
-static void mqtt_connect_callback(mqtt_client_t *client, void *arg, mqtt_connection_status_t status);
-static void mqtt_pubsub_callback(void *arg, err_t result);
+#if USE_MQTT_PUBLISH
+static inline int user_generate_publish_topic(
+    char* topic, int size, const char* param );
+static inline int user_generate_publish_payload(
+    char* payload, int size, const char* param );
+#endif // USE_MQTT_PUBLISH
 
-#if IOT_APP_MODE_PUBLISH
-static inline err_t mqtt_publish_async(mqtt_client_t *client, const char* topic, const char* msg, int msg_len);
-static inline int user_generate_publish_topic(char* topic, int size, const char* param);
-static inline int user_generate_publish_payload(char* payload, int size, const char* param);
-#endif // IOT_APP_MODE_PUBLISH
-
-#if IOT_APP_MODE_SUBSCRIBE
-static inline err_t mqtt_subscribe_async(mqtt_client_t *client, const char* topic);
-static void mqtt_subscribe_recv_topic(void *arg, const char *topic, u32_t tot_len);
-static void mqtt_subscribe_recv_payload(void *arg, const u8_t *data, u16_t len, u8_t flags);
+#if USE_MQTT_SUBSCRIBE
 static inline char* user_generate_subscribe_topic();
-#endif // IOT_APP_MODE_SUBSCRIBE
+static void user_subscribe_receive_cb(
+    iot_subscribe_rcv* mqtt_subscribe_recv );
+#endif // USE_MQTT_SUBSCRIBE
 ///////////////////////////////////////////////////////////////////////////////////
 
 
 
 
 
-static void myputc(void* p, char c)
+static void myputc( void* p, char c )
 {
-    uart_write((ft900_uart_regs_t*) p, (uint8_t) c);
+    uart_write( (ft900_uart_regs_t*) p, (uint8_t) c );
 }
 
 static inline void uart_setup()
 {
     /* enable uart */
-    sys_enable(sys_device_uart0);
-    gpio_function(48, pad_func_3);
-    gpio_function(49, pad_func_3);
+    sys_enable( sys_device_uart0 );
+    gpio_function( 48, pad_func_3 );
+    gpio_function( 49, pad_func_3 );
 
-    uart_open(UART0, 1,
-            UART_DIVIDER_115200_BAUD, uart_data_bits_8, uart_parity_none,
-            uart_stop_bits_1);
+    uart_open(
+        UART0, 1,
+        UART_DIVIDER_19200_BAUD,
+        uart_data_bits_8,
+        uart_parity_none,
+        uart_stop_bits_1
+        );
+
     /* Enable tfp_printf() functionality... */
-    init_printf(UART0, myputc);
+    init_printf( UART0, myputc );
 }
 
 static inline void ethernet_setup()
 {
-    /* Set up Ethernet */
-    sys_enable(sys_device_ethernet);
-
-#ifdef NET_USE_EEPROM
-    /* Set up I2C */
-    sys_enable(sys_device_i2c_master);
-
-    /* Setup I2C channel 0 pins */
-    /* Use sys_i2c_swop(0) to activate. */
-    gpio_function(44, pad_i2c0_scl); /* I2C0_SCL */
-    gpio_function(45, pad_i2c0_sda); /* I2C0_SDA */
-
-    /* Setup I2C channel 1 pins for EEPROM */
-    /* Use sys_i2c_swop(1) to activate. */
-    gpio_function(46, pad_i2c1_scl); /* I2C1_SCL */
-    gpio_function(47, pad_i2c1_sda); /* I2C1_SDA */
-#endif
+    net_setup();
 }
 
-int main(void)
+int main( void )
 {
     sys_reset_all();
     interrupt_disable_globally();
     uart_setup();
     ethernet_setup();
 
-    uart_puts(UART0,
+    uart_puts( UART0,
             "\x1B[2J" /* ANSI/VT100 - Clear the Screen */
             "\x1B[H" /* ANSI/VT100 - Move Cursor to Home */
-            "Copyright (C) Bridgetek Pte Ltd \r\n"
-            "--------------------------------------------------------------------- \r\n"
-            "Welcome to IoT Example... \r\n\r\n"
-            "Demonstrate secure IoT connectivity to IoT cloud services \r\n"
-            "--------------------------------------------------------------------- \r\n");
+            "Copyright (C) Bridgetek Pte Ltd\r\n"
+            "-------------------------------------------------------\r\n"
+            "Welcome to IoT Cloud Example...\r\n\r\n"
+            "Demonstrate secure IoT connectivity with cloud services\r\n"
+            "-------------------------------------------------------\r\n\r\n" );
 
-    if (xTaskCreate(iot_app_task,
+    if (xTaskCreate( iot_app_task,
             IOT_APP_TASK_NAME,
             IOT_APP_TASK_STACK_SIZE,
             NULL,
             IOT_APP_TASK_PRIORITY,
-            NULL) != pdTRUE) {
-        DEBUG_PRINTF("xTaskCreate failed\r\n");
+            NULL ) != pdTRUE ) {
+        DEBUG_PRINTF( "xTaskCreate failed\r\n" );
     }
 
     vTaskStartScheduler();
-    DEBUG_PRINTF("Should never reach here!\r\n");
-
-    for (;;)
-        ;
+    DEBUG_PRINTF( "Should never reach here!\r\n" );
 }
 
-static void iot_app_task(void *pvParameters)
+static inline void display_network_info()
+{
+    uint8_t* mac = net_get_mac();
+    DEBUG_PRINTF( "MAC=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] );
+
+    ip_addr_t addr = net_get_ip();
+    DEBUG_PRINTF( "IP=%s\r\n", inet_ntoa(addr) );
+    addr = net_get_gateway();
+    DEBUG_PRINTF( "GW=%s\r\n", inet_ntoa(addr) );
+    addr = net_get_netmask();
+    DEBUG_PRINTF( "MA=%s\r\n", inet_ntoa(addr) );
+    vTaskDelay( pdMS_TO_TICKS(1000) );
+}
+
+static void iot_app_task( void *pvParameters )
 {
     (void) pvParameters;
+    iot_handle handle = NULL;
 
-    DEBUG_PRINTF("Task %s started.\r\n", __FUNCTION__);
 
-    net_init(ip, gateway, mask, USE_DHCP, dns, hostname, NULL);
+    /* Initialize network */
+    net_init( ip, gateway, mask, USE_DHCP, dns, NULL, NULL );
 
-    while (1)
-    {
-        /* Wait for valid IP address */
-        DEBUG_PRINTF("Waiting for configuration...");
-        while (!net_is_ready()) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            DEBUG_PRINTF(".");
+    iot_utils_init();
+
+    while (1) {
+        /*
+         * Wait until network is ready then display network info
+         *
+         * */
+        DEBUG_PRINTF( "Waiting for configuration..." );
+        int i = 0;
+        while ( !net_is_ready() ) {
+            vTaskDelay( pdMS_TO_TICKS(1000) );
+            DEBUG_PRINTF( "." );
+            if (i++ > 30) {
+                DEBUG_PRINTF( "Could not recover. Do reboot.\r\n" );
+                chip_reboot();
+            }
         }
-        DEBUG_PRINTF("\r\n");
-
-        /* Display IP information */
-        uint8_t* mac = net_get_mac();
-        DEBUG_PRINTF("MAC=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
-            mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-        ip_addr_t addr = net_get_ip();
-        DEBUG_PRINTF("IP=%s\r\n", inet_ntoa(addr));
-        addr = net_get_gateway();
-        DEBUG_PRINTF("GW=%s\r\n", inet_ntoa(addr));
-        addr = net_get_netmask();
-        DEBUG_PRINTF("MA=%s\r\n", inet_ntoa(addr));
-
-        /* MQTT application */
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        DEBUG_PRINTF("Starting...\r\n\r\n");
-        iot_app_process();
-    }
-
-    DEBUG_PRINTF("Task %s finished.\r\n", __FUNCTION__);
-}
+        vTaskDelay( pdMS_TO_TICKS(1000) );
+        DEBUG_PRINTF( "\r\n" );
+        display_network_info();
 
 
+        /*
+         * IoT process
+         *
+         * */
+        DEBUG_PRINTF( "Starting...\r\n\r\n" );
 
-
-
-static inline err_t mqtt_connect_async(mqtt_client_t *client, struct altcp_tls_config *config)
-{
-    struct mqtt_connect_client_info_t ci = {0};
-    err_t err = 0;
-    ip_addr_t host_addr = {0};
-    struct hostent *host = NULL;
-
-
-    /* Get IP address given host name */
-    do {
-        host = gethostbyname(iot_getbrokername());
-        if (host == NULL)
-        {
-            DEBUG_PRINTF("MQTT CONNECT: gethostbyname failed\r\n");
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        /* connect to server using TLS certificates and MQTT credentials
+         * sample call back functions, iot_utils_getcertificates & iot_utils_getcredentials,
+         *     are provided in iot_utils.c to retrieve information from iot_config.h.
+         *     These have been tested to work with Amazon AWS, Google Cloud and Microsoft Azure.
+         */
+        handle = iot_connect(
+            iot_utils_getcertificates, iot_utils_getcredentials );
+        if ( !handle ) {
+            /* make sure to replace the dummy certificates in the Certificates folder */
+            DEBUG_PRINTF( "Error! Please check your certificates and credentials.\r\n\r\n" );
+            vTaskDelay( pdMS_TO_TICKS(1000) );
             continue;
         }
-        break;
-    }
-    while (net_is_ready());
 
-    memset(&ci, 0, sizeof(ci));
-    ci.tls_config = config;
-    ci.client_id = iot_getid();
-    ci.client_user = iot_getusername();
-    ci.client_pass = iot_getpassword();
-
-    /* copy the network address to sockaddr_in structure */
-    if ((host->h_addrtype == AF_INET) && (host->h_length == sizeof(ip_addr_t)))
-    {
-        memcpy(&host_addr, host->h_addr_list[0], sizeof(ip_addr_t));
-
-        DEBUG_PRINTF("MQTT CONNECT: %s %s:%d\r\n",
-                iot_getbrokername(),
-                inet_ntoa(host_addr),
-                iot_getbrokerport());
-
-        err = mqtt_client_connect(client, &host_addr, iot_getbrokerport(), mqtt_connect_callback, (void *)config, &ci);
-        if (err != ERR_OK)
-        {
-            DEBUG_PRINTF("MQTT CONNECT: mqtt_client_connect failed! err=%d\r\n", err);
+        /* subscribe and publish from/to server */
+#if USE_MQTT_SUBSCRIBE
+        char* topic_sub = user_generate_subscribe_topic();
+        if ( iot_subscribe( handle, topic_sub, user_subscribe_receive_cb ) == 0 ) {
+            DEBUG_PRINTF( "\r\nSUB: %s\r\n\r\n", topic_sub );
         }
-    }
-    else
-    {
-        DEBUG_PRINTF("MQTT CONNECT: gethostbyname returned invalid data\r\n");
-        return -1;
-    }
+#endif // USE_MQTT_SUBSCRIBE
+#if USE_MQTT_PUBLISH
+        char* devices[] = { "hopper", "knuth", "turing" };
+        int device_count = sizeof( devices )/sizeof( devices[0] );
+        char topic_pub[48] = {0};
+        char payload[192] = {0};
 
-    return err;
-}
+        /* continuously publish sensor data every second */
+        for ( int i=0 ; ; i++ ) {
 
-static void mqtt_connect_callback(mqtt_client_t *client, void *arg, mqtt_connection_status_t status)
-{
-    static int lExponentialBackoff = 2;
+            // Generate the publish topic and payload
+            // Note that the topic usually does not change
+            // but in this example, our topic is changing
+            int device_index = i % device_count;
+            int len = user_generate_publish_topic(
+                topic_pub, sizeof(topic_pub), devices[device_index] );
+            len = user_generate_publish_payload(
+                payload, sizeof(payload), devices[device_index] );
 
-    if (status == MQTT_CONNECT_ACCEPTED)
-    {
-        DEBUG_PRINTF("MQTT CONNECTED\r\n");
-    }
-    else
-    {
-        DEBUG_PRINTF("MQTT CONNECT FAILED! mqtt_connect_callback result: %d\r\n\r\n\r\n", status);
+            // Publish the generated payload containing sensor data
+            if ( iot_publish( handle, topic_pub, payload, len ) != 0 ) {
+                break;
+            }
+            DEBUG_PRINTF( "\r\nPUB: %s [%d]\r\n%s\r\n", topic_pub, len, payload );
 
-        vTaskDelay(pdMS_TO_TICKS(lExponentialBackoff*1000));
-        lExponentialBackoff = (lExponentialBackoff>32) ? 1 : lExponentialBackoff * 2;
+            // Sleep for 1 second
+            // Note that some sensors generate data more than 1 second
+            vTaskDelay( pdMS_TO_TICKS(1000) );
+        }
+#endif // USE_MQTT_PUBLISH
 
-        /* Try again to connect. */
-        mqtt_connect_async(client, (struct altcp_tls_config *)arg);
-    }
-}
-
-static inline int mqtt_is_connected(mqtt_client_t *client)
-{
-    return mqtt_client_is_connected(client) && net_is_ready();
-}
-
-static void mqtt_pubsub_callback(void *arg, err_t result)
-{
-    if (result != ERR_OK)
-    {
-        DEBUG_PRINTF("MQTT %s result: %d\r\n", (char*)arg, result);
-    }
-}
-
-
-
-///////////////////////////////////////////////////////////////////////////////////
-// IOT PUBLISH
-///////////////////////////////////////////////////////////////////////////////////
-
-#if IOT_APP_MODE_PUBLISH
-static inline err_t mqtt_publish_async(mqtt_client_t *client, const char* topic, const char* msg, int msg_len)
-{
-    err_t err;
-    u8_t retain = 0;
-    u8_t qos = 0;
-
-    err = mqtt_publish(client, topic, msg, msg_len, qos, retain, mqtt_pubsub_callback, "PUBLISH");
-    if (err != ERR_OK)
-    {
-        DEBUG_PRINTF("\r\nMQTT PUBLISH: mqtt_publish failed! err=%d\r\n", err);
-    }
-    else
-    {
-        DEBUG_PRINTF("\r\nMQTT PUBLISH: %s [%d]\r\n%s\r\n", topic, msg_len, msg);
+        /* disconnect from server */
+        iot_disconnect( handle );
     }
 
-    return err;
+    iot_utils_free();
 }
-
-static inline int user_generate_publish_topic(char* topic, int size, const char* param)
-{
-#if (USE_MQTT_BROKER == MQTT_BROKER_AWS_IOT) || (USE_MQTT_BROKER == MQTT_BROKER_AWS_GREENGRASS)
-    return tfp_snprintf(topic, size, "device/%s/devicePayload", param);
-#elif (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
-    return tfp_snprintf(topic, size, "/devices/%s/events", (char*)iot_getdeviceid());
-#elif (USE_MQTT_BROKER == MQTT_BROKER_MAZ_IOT)
-    return tfp_snprintf(topic, size, "/devices/%s/messages/events", (char*)iot_getdeviceid());
-#else
-    return 0;
-#endif
-}
-
-static inline int user_generate_publish_payload(char* payload, int size, const char* param)
-{
-    int len = 0;
-#if (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
-    int format = 1; // YYYYMMDDHH:mm:SS
-#else
-    int format = 0; // YYYY-MM-DDTHH:mm:SS.000
-#endif
-
-
-#if USE_PAYLOAD_TIMESTAMP
-    len = tfp_snprintf(payload, size,
-        "{\r\n"
-        " \"deviceId\": \"%s\",\r\n"
-        " \"timeStampEpoch\": %llu,\r\n"
-        " \"timeStampIso\": \"%s\",\r\n"
-        " \"sensorReading\": %d,\r\n"
-        " \"batteryCharge\": %d,\r\n"
-        " \"batteryDischargeRate\": %d\r\n"
-        "}",
-        param,
-        iot_rtc_get_time_epoch(),
-        iot_rtc_get_time_iso(format),
-        rand() % 10 + 30,
-        rand() % 30 - 10,
-        rand() % 5);
-#else
-    len = tfp_snprintf(payload, size,
-        "{\r\n"
-        " \"deviceId\": \"%s\",\r\n"
-        " \"sensorReading\": %d,\r\n"
-        " \"batteryCharge\": %d,\r\n"
-        " \"batteryDischargeRate\": %d\r\n"
-        "}",
-        param,
-        rand() % 10 + 30,
-        rand() % 30 - 10,
-        rand() % 5);
-#endif
-
-    return len;
-}
-
-#endif // IOT_APP_MODE_PUBLISH
 
 
 
@@ -422,51 +299,7 @@ static inline int user_generate_publish_payload(char* payload, int size, const c
 // IOT SUBSCRIBE
 ///////////////////////////////////////////////////////////////////////////////////
 
-#if IOT_APP_MODE_SUBSCRIBE
-static inline err_t mqtt_subscribe_async(mqtt_client_t *client, const char* topic)
-{
-    err_t err;
-    u8_t qos = 1;
-
-    err = mqtt_subscribe(client, topic, qos, mqtt_pubsub_callback, "SUBSCRIBE");
-    if (err != ERR_OK)
-    {
-        DEBUG_PRINTF("\r\nMQTT SUBSCRIBE: mqtt_subscribe failed! err=%d\r\n", err);
-    }
-    else
-    {
-        DEBUG_PRINTF("\r\nMQTT SUBSCRIBE: %s\r\n\r\n", topic);
-        mqtt_set_inpub_callback(client, mqtt_subscribe_recv_topic, mqtt_subscribe_recv_payload, NULL);
-    }
-
-    return err;
-}
-
-static char subscribe_recv[128] = {0};
-static uint8_t subscribe_recv_size = 0;
-static uint8_t subscribe_recv_off = 0;
-static uint8_t subscribe_recv_process = 0;
-
-static void mqtt_subscribe_recv_topic(void *arg, const char *topic, u32_t tot_len)
-{
-    DEBUG_PRINTF("\r\nMQTT RECEIVE: %s [%d]\r\n", topic, (unsigned int)tot_len);
-    memset(subscribe_recv, 0, sizeof(subscribe_recv));
-    subscribe_recv_off = 0;
-    subscribe_recv_size = tot_len;
-    subscribe_recv_process = (tot_len < sizeof(subscribe_recv)) ? 1 : 0;
-}
-
-static void mqtt_subscribe_recv_payload(void *arg, const u8_t *data, u16_t len, u8_t flags)
-{
-    if (subscribe_recv_process) {
-        memcpy(subscribe_recv + subscribe_recv_off, data, len);
-        subscribe_recv_size -= len;
-        subscribe_recv_off += len;
-        if (subscribe_recv_size == 0) {
-            DEBUG_PRINTF("%s\r\n\r\n", subscribe_recv);
-        }
-    }
-}
+#if USE_MQTT_SUBSCRIBE
 
 static inline char* user_generate_subscribe_topic()
 {
@@ -476,138 +309,120 @@ static inline char* user_generate_subscribe_topic()
 #elif (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
     // Google Cloud does not seem to support MQTT subscribe for telemetry events, only for config
     static char topic[64] = {0};
-    tfp_snprintf(topic, sizeof(topic), "/devices/%s/config", (char*)iot_getdeviceid());
-    //tfp_snprintf(topic, sizeof(topic), "/devices/%s/events", (char*)iot_getdeviceid());
+    tfp_snprintf( topic, sizeof(topic),
+        "/devices/%s/config", (char*)iot_utils_getdeviceid() );
+    //tfp_snprintf(topic, sizeof(topic),
+    //    "/devices/%s/events", (char*)iot_utils_getdeviceid());
     return topic;
-#else
-    return NULL;
-#endif
-}
-
-#endif // IOT_APP_MODE_SUBSCRIBE
-
-
-
-
-
-static void iot_app_process(void)
-{
-    err_t err = ERR_OK;
-    mqtt_client_t mqtt = {0};
-    struct altcp_tls_config *config = NULL;
-#if (USE_MQTT_BROKER == MQTT_BROKER_AWS_IOT) || (USE_MQTT_BROKER == MQTT_BROKER_AWS_GREENGRASS)
-    const uint8_t *ca = NULL;
-    const uint8_t *cert = NULL;
-    const uint8_t *pkey = NULL;
-    size_t ca_len = 0;
-    size_t cert_len = 0;
-    size_t pkey_len = 0;
-#endif
-
-    iot_init();
-
-
-    //
-    // Initialize certificates
-    //
-
-#if (USE_MQTT_BROKER == MQTT_BROKER_AWS_IOT) || (USE_MQTT_BROKER == MQTT_BROKER_AWS_GREENGRASS)
-    // Amazon AWS IoT requires certificate and private key but ca is optional (but recommended)
-    ca = iot_certificate_getca(&ca_len);
-    cert = iot_certificate_getcert(&cert_len);
-    pkey = iot_certificate_getpkey(&pkey_len);
-    config = altcp_tls_create_config_client_2wayauth(ca, ca_len, pkey, pkey_len, NULL, 0, cert, cert_len);
-    vPortFree((uint8_t *)cert);
-    vPortFree((uint8_t *)pkey);
-    vPortFree((uint8_t *)ca);
-#elif (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
-    // Google GCP IoT requires JWT token (created with private key) as MQTT password; no certificate needs to be sent
-    config = altcp_tls_create_config_client_2wayauth(NULL, 0, NULL, 0, NULL, 0, NULL, 0);
 #elif (USE_MQTT_BROKER == MQTT_BROKER_MAZ_IOT)
-    // Microsoft Azure IoT requires SAS token (created with shared access key) as MQTT password; no certificates need to be sent
-    config = altcp_tls_create_config_client_2wayauth(NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    static char topic[64] = {0};
+    tfp_snprintf( topic, sizeof(topic),
+        "devices/%s/messages/devicebound/#", (char*)iot_utils_getdeviceid() );
+    //tfp_snprintf(topic, sizeof(topic),
+    //    "devices/%s/messages/events/#", (char*)iot_utils_getdeviceid());
+    return topic;
+#elif (USE_MQTT_BROKER == MQTT_BROKER_ADAFRUITIO)
+    static char topic[64] = {0};
+    tfp_snprintf( topic, sizeof(topic), "%s/feeds/#", (char*)MQTT_CLIENT_USER );
+#else
+    return "#";
 #endif
-    if (config == NULL)
-    {
-        DEBUG_PRINTF("MQTT CERTIFICATE error\r\n");
-        goto close;
-    }
-
-
-    //
-    // Establish secure MQTT connection
-    //
-
-    memset(&mqtt, 0, sizeof(mqtt_client_t));
-    err = mqtt_connect_async(&mqtt, config);
-    if (err != ERR_OK)
-    {
-        DEBUG_PRINTF("MQTT CONNECT: mqtt_connect_async failed! err=%d\r\n", err);
-        goto close;
-    }
-    do
-    {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    while (!mqtt_is_connected(&mqtt));
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-
-#if IOT_APP_MODE_SUBSCRIBE
-    //
-    // Subscribe from MQTT server
-    //
-
-    err = mqtt_subscribe_async(&mqtt, user_generate_subscribe_topic());
-    if (err != ERR_OK)
-    {
-        DEBUG_PRINTF("MQTT CONNECT: mqtt_subscribe_async failed! err=%d\r\n", err);
-        //goto close;
-    }
-#endif // IOT_APP_MODE_SUBSCRIBE
-
-
-#if IOT_APP_MODE_PUBLISH
-    //
-    // Publish sensor data to MQTT server
-    //
-
-    char *devices[3] = {"hopper", "knuth", "turing"};
-    int device_count = sizeof(devices)/sizeof(devices[0]);
-    char topic[48] = {0};
-    char payload[192] = {0};
-
-    while (mqtt_is_connected(&mqtt) && err==ERR_OK)
-    {
-        // Publish sensor data for each sensor device
-        // In normal scenario, there should be only 1 device
-        for (int i=0; i<device_count && mqtt_is_connected(&mqtt) && err==ERR_OK; i++)
-        {
-            int len = user_generate_publish_topic(topic, sizeof(topic), devices[i]);
-            len = user_generate_publish_payload(payload, sizeof(payload), devices[i]);
-
-            err = mqtt_publish_async(&mqtt, topic, payload, len);
-            if (err==ERR_OK) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-        }
-    }
-#else // IOT_APP_MODE_PUBLISH
-    while (mqtt_is_connected(&mqtt))
-    {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-#endif // IOT_APP_MODE_PUBLISH
-
-
-    //
-    // Release resources
-    //
-
-close:
-    DEBUG_PRINTF("MQTT Application ended...\r\n\r\n\r\n");
-    mqtt_disconnect(&mqtt);
-    altcp_tls_free_config(config);
-    iot_free();
 }
 
+static void user_subscribe_receive_cb( iot_subscribe_rcv* mqtt_subscribe_recv )
+{
+    DEBUG_PRINTF( "\r\nRECV: %s [%d]\r\n",
+        mqtt_subscribe_recv->topic, (unsigned int)mqtt_subscribe_recv->payload_len );
+    DEBUG_PRINTF( "%s\r\n\r\n", mqtt_subscribe_recv->payload );
+}
+
+#endif // USE_MQTT_SUBSCRIBE
+
+
+
+///////////////////////////////////////////////////////////////////////////////////
+// IOT PUBLISH
+///////////////////////////////////////////////////////////////////////////////////
+
+#if USE_MQTT_PUBLISH
+
+static inline int user_generate_publish_topic(
+    char* topic, int size, const char* param )
+{
+    // Google Cloud IoT and Microsoft Azure IoT have fixed format for MQTT publish topic
+    // Amazon AWS IoT supports any format for MQTT publish topic
+#if (USE_MQTT_BROKER == MQTT_BROKER_AWS_IOT) || (USE_MQTT_BROKER == MQTT_BROKER_AWS_GREENGRASS)
+    // Any format - can be modified
+    return tfp_snprintf( topic, size, "device/%s/devicePayload", param );
+#elif (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
+    // Fixed format - do not modify
+    return tfp_snprintf( topic, size, "/devices/%s/events", (char*)iot_utils_getdeviceid() );
+#elif (USE_MQTT_BROKER == MQTT_BROKER_MAZ_IOT)
+    // Fixed format - do not modify
+    return tfp_snprintf( topic, size, "devices/%s/messages/events/", (char*)iot_utils_getdeviceid() );
+#elif (USE_MQTT_BROKER == MQTT_BROKER_ADAFRUITIO)
+    // Should start with <username>/feeds/
+    return tfp_snprintf( topic, size, "%s/feeds/%s", MQTT_CLIENT_USER, param );
+#elif (USE_MQTT_BROKER == MQTT_BROKER_UBIDOTS)
+    // Fixed format - do not modify
+    return tfp_snprintf( topic, size, "/v1.6/devices/%s", (char*)iot_utils_getdeviceid() );
+#elif (USE_MQTT_BROKER == MQTT_BROKER_THINGSPEAK)
+    // Fixed format - do not modify
+    return tfp_snprintf( topic, size, "channels/%s/publish/%s", THINGSPEAK_CHANNEL_ID, THINGSPEAK_WRITE_KEY );
+#else
+    return tfp_snprintf( topic, size, "topic/subtopic" );
+#endif
+}
+
+static inline int user_generate_publish_payload(
+    char* payload, int size, const char* param )
+{
+    int len = 0;
+
+#if USE_PAYLOAD_TIMESTAMP
+#if (USE_MQTT_BROKER == MQTT_BROKER_GCP_IOT)
+    int format = 1; // YYYYMMDDHH:mm:SS
+#else
+    int format = 0; // YYYY-MM-DDTHH:mm:SS.000
+#endif
+
+
+    len = tfp_snprintf( payload, size,
+        "{\r\n"
+        " \"deviceId\": \"%s\",\r\n"
+        " \"timeStampEpoch\": %llu,\r\n"
+        " \"timeStampIso\": \"%s\",\r\n"
+        " \"sensorReading\": %d,\r\n"
+        " \"batteryCharge\": %d,\r\n"
+        " \"batteryDischargeRate\": %d\r\n"
+        "}",
+        param,
+        iot_utils_gettimeepoch(),
+        iot_utils_gettimeiso(format),
+        rand() % 10 + 30,
+        rand() % 30 - 10,
+        rand() % 5 );
+#elif (USE_MQTT_BROKER == MQTT_BROKER_THINGSPEAK)
+    len = tfp_snprintf( payload, size,
+        "field1=%d&field2=%d&field3=%d",
+        rand() % 10 + 30,
+        rand() % 30 - 10,
+        rand() % 5 );
+#else
+    len = tfp_snprintf( payload, size,
+        "{\r\n"
+        " \"deviceId\": \"%s\",\r\n"
+        " \"sensorReading\": %d,\r\n"
+        " \"batteryCharge\": %d,\r\n"
+        " \"batteryDischargeRate\": %d\r\n"
+        "}",
+        param,
+        rand() % 10 + 30,
+        rand() % 30 - 10,
+        rand() % 5 );
+#endif
+
+    return len;
+}
+
+#endif // USE_MQTT_PUBLISH

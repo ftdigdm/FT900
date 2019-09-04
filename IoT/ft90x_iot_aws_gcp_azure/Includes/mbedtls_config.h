@@ -28,6 +28,11 @@
 #ifndef MBEDTLS_CONFIG_H
 #define MBEDTLS_CONFIG_H
 
+// Added this for optimization purposes
+// Remove this if not using mbedtls for iot
+#include <iot_config.h> // For USE_MBEDTLS_MAX_SIZES
+
+
 
 /*-----------------------------------------------------------*/
 
@@ -36,6 +41,10 @@
 #define CIPHERSUITE_OPTION_3         3 // strongest: ECDHE_RSA_AES128_CBC_SHA, ECDHE_RSA_AES256_CBC_SHA
 #define CIPHERSUITE_OPTION_DEFAULT   CIPHERSUITE_OPTION_1
 #define USE_CIPHERSUITE              CIPHERSUITE_OPTION_DEFAULT
+
+#ifndef USE_MBEDTLS_MAX_SIZES
+#define USE_MBEDTLS_MAX_SIZES        1
+#endif
 
 /*-----------------------------------------------------------*/
 
@@ -133,15 +142,21 @@
 /*-----------------------------------------------------------*/
 
 // Optimization related configuration
-#if USE_ECC_CIPHERSUITE
-	#define MBEDTLS_SSL_MAX_CONTENT_LEN (3072+320)
+#if (USE_MBEDTLS_MAX_SIZES==3)
+#define MBEDTLS_SSL_MAX_CONTENT_LEN  (4096+910) // Support AWS IoT ATS
+#define MBEDTLS_MPI_MAX_SIZE         (512)      // Support AWS IoT ATS
+#elif (USE_MBEDTLS_MAX_SIZES==2)
+#define MBEDTLS_SSL_MAX_CONTENT_LEN  (4096+910) // Support AWS IoT ATS
+#define MBEDTLS_MPI_MAX_SIZE         (256)      // Support AWS IoT ATS
+#elif (USE_MBEDTLS_MAX_SIZES==1)
+#define MBEDTLS_SSL_MAX_CONTENT_LEN  (4096)     // Support Azure IoT
+#define MBEDTLS_MPI_MAX_SIZE         (512)      // Support Azure IoT
 #else
-	//#define MBEDTLS_SSL_MAX_CONTENT_LEN (4096)
-	#define MBEDTLS_SSL_MAX_CONTENT_LEN (3072)
+#define MBEDTLS_SSL_MAX_CONTENT_LEN  (3072)     // Works with AWS IoT/Greengrass and GCP IoT
+#define MBEDTLS_MPI_MAX_SIZE         (256)      // Works with AWS IoT/Greengrass and GCP IoT
 #endif
 #define MBEDTLS_AES_ROM_TABLES       // decreases code size by 896 bytes
 #define MBEDTLS_MPI_WINDOW_SIZE 1    // decreases code size by 808 bytes
-#define MBEDTLS_MPI_MAX_SIZE 256     // decreases code size by 64 bytes
 #define MBEDTLS_SHA256_SMALLER       // decreases code size by 2944 bytes
 #define MBEDTLS_TLS_DEFAULT_ALLOW_SHA1_IN_KEY_EXCHANGE
 
@@ -156,6 +171,11 @@
  * "lwip/apps/altcp_tls_mbedtls_opts.c"
  */
 #define MBEDTLS_PLATFORM_NO_STD_FUNCTIONS
+
+/* Support for port 443 */
+#if (MQTT_BROKER_PORT == 443)
+#define MBEDTLS_SSL_ALPN
+#endif
 
 /*-----------------------------------------------------------*/
 
